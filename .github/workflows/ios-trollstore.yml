@@ -1,0 +1,126 @@
+# 把上游官方 release tag 编译成 iOS 安装包（ad-hoc 签名、不含描述文件），用 TrollStore（巨魔）安装。
+# 手动运行：Actions → iOS IPA (TrollStore) → Run workflow；tag 留空时构建上游最新正式版。
+# ipa 任务产出安装包 artifact；simulator-smoke 任务在 iPhone 模拟器里启动游戏并截图，它失败不影响 ipa。
+name: iOS IPA (TrollStore)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 上游 tag，例如 v4.0.2；留空 = 最新正式版
+        required: false
+        default: ""
+  push:
+    branches: [master]
+    paths: [.github/workflows/ios-trollstore.yml]
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: 00-Evan/shattered-pixel-dungeon
+  BUNDLE_ID: com.shatteredpixel.shatteredpixeldungeon.apple
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)}"
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building \`$UPSTREAM@$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+  ipa:
+    needs: resolve
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Clone upstream
+        run: git clone --depth 1 --branch "$TAG" "https://github.com/$UPSTREAM.git" src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          java -version
+      - name: Build IPA
+        working-directory: src
+        # iosSkipSigning：RoboVM 改用 ad-hoc 签名，不需要 Apple 开发者证书；TrollStore 安装时会自己补签
+        run: ./gradlew --no-daemon --configure-on-demand --stacktrace :ios:createIPA -Probovm.iosSkipSigning=true
+      - name: Inspect IPA
+        run: |
+          ipa=$(find src/ios/build -name '*.ipa' -print -quit)
+          test -n "$ipa"
+          mkdir -p out
+          out="out/ShatteredPD-$TAG-iOS-TrollStore.ipa"
+          cp "$ipa" "$out"
+          unzip -q "$out" -d unpacked
+          app=$(ls -d unpacked/Payload/*.app)
+          plutil -p "$app/Info.plist"
+          lipo -info "$app/$(plutil -extract CFBundleExecutable raw "$app/Info.plist")"
+          codesign -dvv "$app"
+          codesign -d --entitlements - "$app" || true
+          ls -l "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShatteredPD-${{ needs.resolve.outputs.tag }}-iOS-TrollStore
+          path: out/*.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+  simulator-smoke:
+    needs: resolve
+    runs-on: macos-15
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Clone upstream
+        run: git clone --depth 1 --branch "$TAG" "https://github.com/$UPSTREAM.git" src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Launch in iPhone simulator
+        working-directory: src
+        run: |
+          log="$GITHUB_WORKSPACE/simulator.log"
+          ./gradlew --no-daemon --configure-on-demand :ios:launchIPhoneSimulator > "$log" 2>&1 &
+          gradle=$!
+          # 模拟器里 launchctl 列出的应用进程：第一列是 PID（数字 = 正在运行）
+          running() {
+            xcrun simctl spawn booted launchctl list 2>/dev/null \
+              | awk -v id="$BUNDLE_ID" 'index($0, id) && $1 ~ /^[0-9]+$/ { found = 1 } END { exit !found }'
+          }
+          for _ in $(seq 360); do
+            running && break
+            kill -0 "$gradle" 2>/dev/null || break
+            sleep 10
+          done
+          if ! running; then echo "::error::app did not start"; tail -n 100 "$log"; exit 1; fi
+          sleep 60
+          xcrun simctl io booted screenshot "$GITHUB_WORKSPACE/simulator.png"
+          if ! running; then echo "::error::app exited within 60s of launch"; tail -n 100 "$log"; exit 1; fi
+          echo "app still running 60s after launch"
+          kill "$gradle" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulator-smoke
+          path: |
+            simulator.png
+            simulator.log
+          if-no-files-found: ignore
