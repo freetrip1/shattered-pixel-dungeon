@@ -1,6 +1,7 @@
 # 把上游官方 release tag 编译成 iOS 安装包（ad-hoc 签名、不含描述文件），用 TrollStore（巨魔）安装。
 # 手动运行：Actions → iOS IPA (TrollStore) → Run workflow；tag 留空时构建上游最新正式版。
 # ipa 任务产出安装包 artifact；simulator-smoke 任务在 iPhone 模拟器里启动游戏并截图，它失败不影响 ipa。
+# 默认用 Intel 编译机：GitHub 的 arm64 macOS 机器容量不足时，任务排队 15 分钟后会被取消。
 name: iOS IPA (TrollStore)
 
 on:
@@ -10,6 +11,11 @@ on:
         description: 上游 tag，例如 v4.0.2；留空 = 最新正式版
         required: false
         default: ""
+      runner:
+        description: macOS 编译机（arm64 的 macos-26 / macos-15 经常排不上队）
+        type: choice
+        options: [macos-26-intel, macos-15-intel, macos-26, macos-15]
+        default: macos-26-intel
   push:
     branches: [master]
     paths: [.github/workflows/ios-trollstore.yml]
@@ -39,7 +45,7 @@ jobs:
 
   ipa:
     needs: resolve
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-26-intel' }}
     timeout-minutes: 90
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
@@ -82,7 +88,7 @@ jobs:
 
   simulator-smoke:
     needs: resolve
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-26-intel' }}
     timeout-minutes: 90
     continue-on-error: true
     env:
