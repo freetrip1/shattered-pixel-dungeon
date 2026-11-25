@@ -25,7 +25,6 @@ permissions:
 
 env:
   UPSTREAM: 00-Evan/shattered-pixel-dungeon
-  BUNDLE_ID: com.shatteredpixel.shatteredpixeldungeon.apple
 
 jobs:
   resolve:
@@ -89,7 +88,7 @@ jobs:
   simulator-smoke:
     needs: resolve
     runs-on: ${{ inputs.runner || 'macos-26-intel' }}
-    timeout-minutes: 90
+    timeout-minutes: 45
     continue-on-error: true
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
@@ -106,21 +105,22 @@ jobs:
           log="$GITHUB_WORKSPACE/simulator.log"
           ./gradlew --no-daemon --configure-on-demand :ios:launchIPhoneSimulator > "$log" 2>&1 &
           gradle=$!
-          # 模拟器里 launchctl 列出的应用进程：第一列是 PID（数字 = 正在运行）
-          running() {
-            xcrun simctl spawn booted launchctl list 2>/dev/null \
-              | awk -v id="$BUNDLE_ID" 'index($0, id) && $1 ~ /^[0-9]+$/ { found = 1 } END { exit !found }'
-          }
-          for _ in $(seq 360); do
+          # 模拟器里的 App 在宿主机上也是一个进程，进程名就是可执行文件名 IOSLauncher
+          running() { pgrep -x IOSLauncher > /dev/null; }
+          for i in $(seq 150); do  # 最多等 25 分钟（编译约 7 分钟）
             running && break
             kill -0 "$gradle" 2>/dev/null || break
+            (( i % 6 == 0 )) && echo "[$((i / 6)) min] $(tail -n 1 "$log" | cut -c1-160)"
             sleep 10
           done
-          if ! running; then echo "::error::app did not start"; tail -n 100 "$log"; exit 1; fi
+          if ! running; then echo "::error::app did not start"; tail -n 150 "$log"; exit 1; fi
+          echo "app process started"
+          xcrun simctl list devices booted
           sleep 60
           xcrun simctl io booted screenshot "$GITHUB_WORKSPACE/simulator.png"
-          if ! running; then echo "::error::app exited within 60s of launch"; tail -n 100 "$log"; exit 1; fi
+          if ! running; then echo "::error::app exited within 60s of launch"; tail -n 150 "$log"; exit 1; fi
           echo "app still running 60s after launch"
+          tail -n 40 "$log"
           kill "$gradle" || true
       - uses: actions/upload-artifact@v7
         if: always()
